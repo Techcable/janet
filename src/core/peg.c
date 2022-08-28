@@ -685,78 +685,17 @@ tail:
  * Compilation
  */
 
-enum peg_builder_mode {
-    BUILDER_DIRECT
-    BUILDER_DISASM,
-};
-
-enum opcode_format {
-    OP_UNKOWN = 0,
-    OP_FIX1,
-    OP_FIX2,
-    OP_FIX3,
-};
-
-struct nested_bytecode {
-    struct nested_bytecode *parent;
-    JanetArray *bytecode;
-};
-
 typedef struct {
     JanetTable *grammar;
     JanetTable *default_grammar;
     JanetTable *tags;
     Janet *constants;
+    uint32_t *bytecode;
     Janet form;
     int depth;
     uint32_t nexttag;
     int has_backref;
-    enum peg_builder_mode;
-    union {
-        struct {
-            uint32_t *bytecode;
-        } direct;
-        struct {
-            JanetArray *flat_bytecode;
-            struct nested_bytecode *current_nested;
-        } disasm;
-    };
 } Builder;
-
-#define assert_builder_mode(b, mode) janet_assert(b->mode == mode, "builder->mode != " #mode)
-#define assert_opcode_fmt(b, fmt) do { if ((b)->mode == BUILDER_DISASM) janet_assert(b->disasm->expected_fmt == (fmt), "Expected opcode " # fmt); } while (false)
-#define set_opcode_fmt(b, fmt) do { if ((b)->mode == BUILDER_DISASM) { \
-        assert_opcode_fmt(b, OP_UNKNOWN); \
-        b->disasm->expected_fmt = fmt; \
-    } } while(false)
-
-
-static JanetArray *peg_push_nested(Builder *b) {
-    assert_builder_mode(b, BUILDER_DISASM);
-    janet_assert(b->disasm.current_nested != NULL, "uninitialized nested array");
-    struct nested_bytecode *new_level = janet_smalloc(sizeof(struct nested_bytecode));
-    new_level->parent = b->disasm.current_nested;
-    new_level->bytecode = janet_array(4);
-    b->disasm.current_nested = new_level;
-    return new_level->bytecode;
-}
-// NOTE: permit_final_pop should only be true in builder_cleanup
-static JanetArray *peg_pop_nested_raw(Builder *b, bool permit_final_pop) {
-    assert_buidler_mode(b, BUILDER_DISASM);
-    if (b->disasm.current_nested != NULL) {
-        struct nested_bytecode *nested = b->disasm.current_nested;
-        JanetArray *val = nested->bytecode;
-        b->disasm.current_nested = nested->parent;
-        janet_sfree(nested);
-        return bytecode;
-    } else {
-        janet_assert_mode(permit_final_pop, "Popped final value in array");
-        return NULL;
-    }
-}
-static inline JanetArray *peg_pop_nested(Buildef *b) {
-    return peg_pop_nested_raw(b, false);
-}
 
 /* Forward declaration to allow recursion */
 static uint32_t peg_compile1(Builder *b, Janet peg);
@@ -767,14 +706,7 @@ static uint32_t peg_compile1(Builder *b, Janet peg);
 
 static void builder_cleanup(Builder *b) {
     janet_v_free(b->constants);
-    switch (b->mode) {
-        case BUILDER_DISASM:
-            while (peg_pop_nested_raw(b, true) != NULL) {}
-            break;
-        case BUILDER_DIRECT:
-            free(b->direct.bytecode);
-            break;
-    }
+    janet_v_free(b->bytecode);
 }
 
 JANET_NO_RETURN static void peg_panic(Builder *b, const char *msg) {
@@ -840,7 +772,7 @@ static uint32_t emit_constant(Builder *b, Janet c) {
     janet_v_push(b->constants, c);
     return cindex;
 }
-..//
+
 static uint32_t emit_tag(Builder *b, Janet t) {
     if (!janet_checktype(t, JANET_KEYWORD))
         peg_panicf(b, "expected keyword for capture tag, got %v", t);
@@ -870,21 +802,11 @@ typedef struct {
 
 static Reserve reserve(Builder *b, int32_t size) {
     Reserve r;
-    switch (size) {
-        case BUILDER_DIRECT:
-            r.index = janet_v_count(b->direct.bytecode);
-            r.builder = b;
-            r.size = size;
-            for (int32_t i = 0; i < size; i++)
-                janet_v_push(b->direct.bytecode, 0);
-            break;
-        case BUILDER_DISASM:
-            // minimal for compat
-            r.index = b->disasm.flat_bytecode->count;
-            r.builder = b;
-            r.size = size;
-            break;
-    }
+    r.index = janet_v_count(b->bytecode);
+    r.builder = b;
+    r.size = size;
+    for (int32_t i = 0; i < size; i++)
+        janet_v_push(b->bytecode, 0);
     return r;
 }
 
@@ -908,16 +830,13 @@ static void emit_bytes(Builder *b, uint32_t op, int32_t len, const uint8_t *byte
 
 /* For fixed arity rules of arities 1, 2, and 3 */
 static void emit_1(Reserve r, uint32_t op, uint32_t arg) {
-    assert_opcode_fmt(r.builder, OP_FIX1);
     emit_rule(r, op, 1, &arg);
 }
 static void emit_2(Reserve r, uint32_t op, uint32_t arg1, uint32_t arg2) {
-    assert_opcode_fmt(r.builder, OP_FIX2);
     uint32_t arr[2] = {arg1, arg2};
     emit_rule(r, op, 2, arr);
 }
 static void emit_3(Reserve r, uint32_t op, uint32_t arg1, uint32_t arg2, uint32_t arg3) {
-    assert_opcode_fmt(r.builder, OP_FIX3);
     uint32_t arr[3] = {arg1, arg2, arg3};
     emit_rule(r, op, 3, arr);
 }
@@ -938,8 +857,7 @@ static void spec_range(Builder *b, int32_t argc, const Janet *argv) {
         uint32_t arg = str[0] | (str[1] << 16);
         emit_1(r, RULE_RANGE, arg);
     } else {
-        /* Com
-         * pile as a set */
+        /* Compile as a set */
         Reserve r = reserve(b, 9);
         uint32_t bitmap[8] = {0};
         for (int32_t i = 0; i < argc; i++) {
@@ -1693,10 +1611,6 @@ static JanetPeg *make_peg(Builder *b) {
 
 /* Compiler entry point */
 static JanetPeg *compile_peg(Janet x) {
-    return compile_peg(x, BUILDER_DIRECT);
-}
-
-static JanetPeg *compile_peg(Janet x, enum janet_builder_mode) {
     Builder builder;
     builder.grammar = janet_table(0);
     builder.default_grammar = NULL;
@@ -1705,20 +1619,6 @@ static JanetPeg *compile_peg(Janet x, enum janet_builder_mode) {
         if (janet_checktype(default_grammarv, JANET_TABLE)) {
             builder.default_grammar = janet_unwrap_table(default_grammarv);
         }
-    }
-    builder.mode = mode;
-    switch (mode) {
-        case BUILDER_DIRECT:
-            builder.direct.bytecode = NULL;
-            break;
-        case BUILDER_DISASM:
-            builder.disasm.flat_bytecode = janet_array(64);
-            builder.disasm.nested_bytecdoe = janet_smalloc(sizeof(struct nested_bytecode));
-            builer.disasm.nested_bytecode = (struct nested_bytecode) {
-                .parent = NULL, // root
-                .bytecode = janet_array(8), // we expect some extra usage at the root?
-            };
-            break;
     }
     builder.tags = janet_table(0);
     builder.constants = NULL;
