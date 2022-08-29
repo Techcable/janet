@@ -69,7 +69,7 @@ static const char *OPCODE_NAME_TABLE[] = {
     "RULE_LINE",
     "RULE_COLUMN",
     "RULE_UNREF",
-    "RULE_CAPTURE_NUM"
+    "RULE_CAPTURE_NUM",
     NULL,
 };
 
@@ -1780,16 +1780,15 @@ JANET_CORE_FN(cfun_peg_replace,
 }
 
 JANET_CORE_FN(cfun_peg_disasm,
-              "(peg/disasm pegDesc)",
-              "Disassemble the specified peg grammar, similar to builtin (disasm) function for regular bytecode."
-              "Currently, this does not support pegs which have already been compiled (it functions as essentially an alternative backend)") {
-    
+              "(peg/disasm peg)",
+              "Disassemble the specified peg grammar, similar to builtin (disasm) function for regular bytecode.") {
+    janet_panic("Not implemented");
 }
 
 static JanetMethod peg_methods[] = {
     {"match", cfun_peg_match},
     {"find", cfun_peg_find},
-    {"disasm", cfun_peg_dis},
+    {"disasm", cfun_peg_disasm},
     {"find-all", cfun_peg_find_all},
     {"replace", cfun_peg_replace},
     {"replace-all", cfun_peg_replace_all},
@@ -1812,7 +1811,7 @@ static Janet peg_next(void *p, Janet key) {
 void janet_lib_peg(JanetTable *env) {
     JanetRegExt cfuns[] = {
         JANET_CORE_REG("peg/compile", cfun_peg_compile),
-        JANET_CORE_REG("peg/disasm", cfunc_peg_disasm),
+        JANET_CORE_REG("peg/disasm", cfun_peg_disasm),
         JANET_CORE_REG("peg/match", cfun_peg_match),
         JANET_CORE_REG("peg/find", cfun_peg_find),
         JANET_CORE_REG("peg/find-all", cfun_peg_find_all),
