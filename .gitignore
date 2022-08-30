@@ -13,6 +13,9 @@ janet
 janet-*.tar.gz
 dist
 
+# Clangd
+.cache
+
 # jpm lockfile
 lockfile.janet
 
