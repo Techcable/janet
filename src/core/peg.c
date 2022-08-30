@@ -27,6 +27,7 @@
 #include "util.h"
 #include "vector.h"
 #include "util.h"
+#include <stdbool.h>
 #endif
 
 #ifdef JANET_PEG
@@ -35,43 +36,44 @@
  * Runtime
  */
 
-
-// A table of opcode enum names (in their C style)
-static const char *OPCODE_NAME_TABLE[] = {
-    "RULE_LITERAL",
-    "RULE_NCHAR",
-    "RULE_NOTNCHAR",
-    "RULE_RANGE",
-    "RULE_SET",
-    "RULE_LOOK",
-    "RULE_CHOICE",
-    "RULE_SEQUENCE",
-    "RULE_IF",
-    "RULE_IFNOT",
-    "RULE_NOT",
-    "RULE_BETWEEN",
-    "RULE_GETTAG",
-    "RULE_CAPTURE",
-    "RULE_POSITION",
-    "RULE_ARGUMENT",
-    "RULE_CONSTANT",
-    "RULE_ACCUMULATE",
-    "RULE_GROUP",
-    "RULE_REPLACE",
-    "RULE_MATCHTIME",
-    "RULE_ERROR",
-    "RULE_DROP",
-    "RULE_BACKMATCH",
-    "RULE_TO",
-    "RULE_THRU",
-    "RULE_LENPREFIX",
-    "RULE_READINT",
-    "RULE_LINE",
-    "RULE_COLUMN",
-    "RULE_UNREF",
-    "RULE_CAPTURE_NUM",
-    NULL,
+// Maximum peg opcode (inclusive)
+#define MAX_PEG_OPCODE 0x1F
+#define X(id) [id] = #id
+static const char *OPCODE_NAME_INFO[MAX_PEG_OPCODE + 1] = {
+    X(RULE_LITERAL),
+    X(RULE_NCHAR),
+    X(RULE_NOTNCHAR),
+    X(RULE_RANGE),
+    X(RULE_SET),
+    X(RULE_LOOK),
+    X(RULE_CHOICE),
+    X(RULE_SEQUENCE),
+    X(RULE_IF),
+    X(RULE_IFNOT),
+    X(RULE_NOT),
+    X(RULE_BETWEEN),
+    X(RULE_GETTAG),
+    X(RULE_CAPTURE),
+    X(RULE_POSITION),
+    X(RULE_ARGUMENT),
+    X(RULE_CONSTANT),
+    X(RULE_ACCUMULATE),
+    X(RULE_GROUP),
+    X(RULE_REPLACE),
+    X(RULE_MATCHTIME),
+    X(RULE_ERROR),
+    X(RULE_DROP),
+    X(RULE_BACKMATCH),
+    X(RULE_TO),
+    X(RULE_THRU),
+    X(RULE_LENPREFIX),
+    X(RULE_READINT),
+    X(RULE_LINE),
+    X(RULE_COLUMN),
+    X(RULE_UNREF),
+    X(RULE_CAPTURE_NUM),
 };
+#undef X
 
 /* Hold captured patterns and match state */
 typedef struct {
@@ -1389,6 +1391,273 @@ static size_t size_padded(size_t offset, size_t size) {
     return x - (x % size);
 }
 
+// The format of a PEG bytecode instruction
+enum peg_instruction_fmt {
+    FMT_VARBYTES, // [len, bytes...] (RULE_LITERAL)
+    FMT_NESTED_RULES, // [len, rules...] (RULE_CHOICE, RULE_SEQUENCE) - These are most powerful!
+    // Fixed size instructions (not dependent on bytecode, only on format type)
+    FMT_FIXED_SIZE_START = 64, // star of fixed size formats (not valid itself)
+    FMT_1WORD, // [1 word]
+    FMT_2WORD, // [2 word]
+    FMT_3WORD, // [3 word]
+    FMT_BITMAP, // [bitmap (8 words)] (RULE_BITMAP)
+};
+static uint32_t peg_fmt_fixed_size(enum peg_instruction_fmt fmt) {
+    switch (fmt) {
+        case FMT_1WORD:
+        case FMT_2WORD:
+        case FMT_3WORD: {
+            int delta = fmt - FMT_FIXED_SIZE_START;
+            janet_assert(delta > 0, "Expected size > 0");
+            return (uint32_t) delta;
+        }
+        case FMT_BITMAP:
+            return 8;
+        default:
+            janet_panicf("Not a fixed size format: %d", fmt);
+    }
+}
+typedef union peg_instruction_data {
+    struct {
+        uint32_t len;
+        uint8_t *bytes;
+    } varbytes;
+    struct {
+        uint32_t len;
+        uint32_t *rules;
+    } nested_rules;
+    uint32_t fixed_size;
+} PegInsnData;
+typedef struct peg_instruction {
+    JanetPegOpcod opcode;
+    enum peg_instruction_fmt fmt;
+    uint32_t *encoded;
+    uint32_t encoded_size;
+    uint32_t current_offset;
+    PegInsnData data;
+} PegInsn;
+
+/* Used only for debugging */
+static uint32_t peg_insn_compute_size(const PegInsn *insn) {
+    if (insn->fmt > FMT_FIXED_SIZE_START) {
+        janet_assert(peg_fmt_fixed_size(insn->fmt) == insn->data.fixed_size, "Misleading `fixed_size` member"); 
+        return 1 + insn->data.fixed_size;
+    }
+    switch (insn->fmt) {
+        case FMT_VARBYTES:
+            // divide by four round up
+            return 1 + (insn->data.varbytes.len + 3) / 4;
+        case FMT_NESTED_RULES:
+            return 1 + insn->data.varbytes.len;
+        default:
+            JANET_EXIT("Unexpected instruction");
+    }
+}
+
+
+typedef void (*verifier_callback_func)(void *ctx, const PegInsn *insn);
+
+typedef struct peg_verifier {
+    void *user_ctx;
+    uint32_t blen, clen;
+    uint32_t *bytecode;
+    uint8_t *op_flags;
+    bool has_backref;
+    uint32_t idx;
+    verifier_callback_func callback;
+    /* interanl state used for callbacks */
+    uint32_t *current_encoded;
+    JanetPegOpcod current_opcode;
+} PegVerifier;
+
+static inline void peg_verify_advance(PegVerifier *verifier, uint32_t encoded_size, enum peg_instruction_fmt fmt, PegInsnData data) {
+    janet_assert(encoded_size >= 1, "Must be at least one byte");
+    janet_assert(verifier->idx + encoded_size <= verifier->blen, "Out of bounds");
+    const PegInsn insn = {
+        .opcode = verifier->current_opcode,
+        .encoded = verifier->current_encoded,
+        .encoded_size = encoded_size, // verified later
+        .data = data,
+        .fmt = fmt,
+        .current_offset = verifier->idx,
+    };
+    if (verifier->callback != NULL) {
+        (verifier->callback)(verifier->user_ctx, &insn);
+    }
+    verifier->idx += encoded_size;
+}
+
+static void peg_verify_free(PegVerifier *verifier) {
+    janet_free(verifier->op_flags);
+}
+static PegVerifier peg_verify_init(JanetPeg *peg) {
+    /* After here, no panics except for the bad: label. */
+
+    /* Keep track at each index if an instruction was
+     * reference (0x01) or is in a main bytecode position
+     * (0x02). This lets us do a linear scan and not
+     * need to a depth first traversal. It is stricter
+     * than a dfs by not allowing certain kinds of unused
+     * bytecode. */
+    PegVerifier verifier = {.has_backref = false, .idx = 0};
+
+    verifier.blen = (int32_t) peg->bytecode_len;
+    verifier.clen = peg->num_constants;
+    verifier.op_flags = janet_calloc(1, verifier.blen);
+    if (NULL == verifier.op_flags) {
+        JANET_OUT_OF_MEMORY;
+    }
+    return verifier;
+}
+
+static void peg_verify_run(PegVerifier *verifier) {
+    uint32_t *bytecode = verifier->bytecode;
+    uint8_t *op_flags = verifier->op_flags;
+    uint32_t blen = verifier->blen, clen = verifier->clen;
+    /* verify peg bytecode */
+    while (verifier->idx < verifier->blen) {
+        uint32_t instr = bytecode[verifier->idx];
+        uint32_t *rule = verifier->current_encoded = bytecode + verifier->idx;
+        op_flags[verifier->idx] |= 0x02;
+        JanetPegOpcod opcode = verifier->current_opcode = (JanetPegOpcod) (instr & MAX_PEG_OPCODE);
+#define advance(amt, fmt, desig, ...) \
+    peg_verify_advance(verifier, amt, fmt, (PegInsnData) { .desig = __VA_ARGS__ })
+#define advance_fixed(size, fmt) do { \
+        size_t amt = size; \
+        janet_assert(fmt >= FMT_FIXED_SIZE_START, "Not a fixed-size format: " #fmt); \
+        janet_assert(amt == peg_fmt_fixed_size(fmt), "Unexpected size " #size " for " #fmt); \
+        advance(amt + 1, fmt, fixed_size, amt); \
+    } while(false)
+        switch (opcode) {
+            case RULE_LITERAL:
+                advance(2 + ((rule[1] + 3) >> 2), FMT_VARBYTES, varbytes, { .len = rule[1], .bytes = (uint8_t*) (rule + 2) });
+                break;
+            case RULE_NCHAR:
+            case RULE_NOTNCHAR:
+            case RULE_RANGE:
+            case RULE_POSITION:
+            case RULE_LINE:
+            case RULE_COLUMN:
+                /* [1 word] */
+                advance_fixed(1, FMT_1WORD);
+                break;
+            case RULE_BACKMATCH:
+                /* [1 word] */
+                advance_fixed(1, FMT_1WORD);
+                verifier->has_backref = true;
+                break;
+            case RULE_SET:
+                /* [8 words] */
+                advance_fixed(8, FMT_BITMAP);
+                break;
+            case RULE_LOOK:
+                /* [offset, rule] */
+                if (rule[2] >= blen) goto bad;
+                op_flags[rule[2]] |= 0x1;
+                advance_fixed(2, FMT_2WORD);
+                break;
+            case RULE_CHOICE:
+            case RULE_SEQUENCE:
+                /* [len, rules...] */
+            {
+                uint32_t len = rule[1];
+                for (uint32_t j = 0; j < len; j++) {
+                    if (rule[2 + j] >= blen) goto bad;
+                    op_flags[rule[2 + j]] |= 0x1;
+                }
+                advance(2 + len, FMT_NESTED_RULES, nested_rules, { .len = len, .rules = rule + 2 });
+            }
+            break;
+            case RULE_IF:
+            case RULE_IFNOT:
+            case RULE_LENPREFIX:
+                /* [rule_a, rule_b (b if not a)] */
+                if (rule[1] >= blen) goto bad;
+                if (rule[2] >= blen) goto bad;
+                op_flags[rule[1]] |= 0x01;
+                op_flags[rule[2]] |= 0x01;
+                advance_fixed(2, FMT_2WORD);
+                break;
+            case RULE_BETWEEN:
+                /* [lo, hi, rule] */
+                if (rule[3] >= blen) goto bad;
+                op_flags[rule[3]] |= 0x01;
+                advance_fixed(3, FMT_3WORD);
+                break;
+            case RULE_ARGUMENT:
+                /* [searchtag, tag] */
+                advance_fixed(2, FMT_2WORD);
+                break;
+            case RULE_GETTAG:
+                /* [searchtag, tag] */
+                advance_fixed(2, FMT_2WORD);
+                verifier->has_backref = true;
+                break;
+            case RULE_CONSTANT:
+                /* [constant, tag] */
+                if (rule[1] >= clen) goto bad;
+                advance_fixed(2, FMT_2WORD);
+                break;
+            case RULE_CAPTURE_NUM:
+                /* [rule, base, tag] */
+                if (rule[1] >= blen) goto bad;
+                op_flags[rule[1]] |= 0x01;
+                advance_fixed(3, FMT_3WORD);
+                break;
+            case RULE_ACCUMULATE:
+            case RULE_GROUP:
+            case RULE_CAPTURE:
+            case RULE_UNREF:
+                /* [rule, tag] */
+                if (rule[1] >= blen) goto bad;
+                op_flags[rule[1]] |= 0x01;
+                advance_fixed(2, FMT_2WORD);
+                break;
+            case RULE_REPLACE:
+            case RULE_MATCHTIME:
+                /* [rule, constant, tag] */
+                if (rule[1] >= blen) goto bad;
+                if (rule[2] >= clen) goto bad;
+                op_flags[rule[1]] |= 0x01;
+                advance_fixed(3, FMT_3WORD);
+                break;
+            case RULE_ERROR:
+            case RULE_DROP:
+            case RULE_NOT:
+            case RULE_TO:
+            case RULE_THRU:
+                /* [rule] */
+                if (rule[1] >= blen) goto bad;
+                op_flags[rule[1]] |= 0x01;
+                advance_fixed(1, FMT_1WORD);
+                break;
+            case RULE_READINT:
+                /* [ width | (endianess << 5) | (signedness << 6), tag ] */
+                if (rule[1] > JANET_MAX_READINT_WIDTH) goto bad;
+                advance_fixed(2, FMT_2WORD);
+                break;
+            default:
+                goto bad;
+        }
+    }
+#undef advance
+#undef advance_fixed
+
+    /* last instruction cannot overflow */
+    if (verifier->idx != blen) goto bad;
+
+    /* Make sure all referenced instructions are actually
+     * in instruction positions. */
+    for (uint32_t i = 0; i < verifier->blen; i++)
+        if (op_flags[i] == 0x01) goto bad;
+
+    return;
+
+    bad:
+        janet_free(op_flags);
+        janet_panic("invalid peg bytecode");
+}
+
 static void *peg_unmarshal(JanetMarshalContext *ctx) {
     size_t bytecode_len = janet_unmarshal_size(ctx);
     uint32_t num_constants = (uint32_t) janet_unmarshal_int(ctx);
@@ -1417,159 +1686,15 @@ static void *peg_unmarshal(JanetMarshalContext *ctx) {
     for (uint32_t j = 0; j < peg->num_constants; j++)
         constants[j] = janet_unmarshal_janet(ctx);
 
-    /* After here, no panics except for the bad: label. */
-
-    /* Keep track at each index if an instruction was
-     * reference (0x01) or is in a main bytecode position
-     * (0x02). This lets us do a linear scan and not
-     * need to a depth first traversal. It is stricter
-     * than a dfs by not allowing certain kinds of unused
-     * bytecode. */
-    uint32_t blen = (int32_t) peg->bytecode_len;
-    uint32_t clen = peg->num_constants;
-    uint8_t *op_flags = janet_calloc(1, blen);
-    if (NULL == op_flags) {
-        JANET_OUT_OF_MEMORY;
-    }
-
-    /* verify peg bytecode */
-    int32_t has_backref = 0;
-    uint32_t i = 0;
-    while (i < blen) {
-        uint32_t instr = bytecode[i];
-        uint32_t *rule = bytecode + i;
-        op_flags[i] |= 0x02;
-        switch (instr & 0x1F) {
-            case RULE_LITERAL:
-                i += 2 + ((rule[1] + 3) >> 2);
-                break;
-            case RULE_NCHAR:
-            case RULE_NOTNCHAR:
-            case RULE_RANGE:
-            case RULE_POSITION:
-            case RULE_LINE:
-            case RULE_COLUMN:
-                /* [1 word] */
-                i += 2;
-                break;
-            case RULE_BACKMATCH:
-                /* [1 word] */
-                i += 2;
-                has_backref = 1;
-                break;
-            case RULE_SET:
-                /* [8 words] */
-                i += 9;
-                break;
-            case RULE_LOOK:
-                /* [offset, rule] */
-                if (rule[2] >= blen) goto bad;
-                op_flags[rule[2]] |= 0x1;
-                i += 3;
-                break;
-            case RULE_CHOICE:
-            case RULE_SEQUENCE:
-                /* [len, rules...] */
-            {
-                uint32_t len = rule[1];
-                for (uint32_t j = 0; j < len; j++) {
-                    if (rule[2 + j] >= blen) goto bad;
-                    op_flags[rule[2 + j]] |= 0x1;
-                }
-                i += 2 + len;
-            }
-            break;
-            case RULE_IF:
-            case RULE_IFNOT:
-            case RULE_LENPREFIX:
-                /* [rule_a, rule_b (b if not a)] */
-                if (rule[1] >= blen) goto bad;
-                if (rule[2] >= blen) goto bad;
-                op_flags[rule[1]] |= 0x01;
-                op_flags[rule[2]] |= 0x01;
-                i += 3;
-                break;
-            case RULE_BETWEEN:
-                /* [lo, hi, rule] */
-                if (rule[3] >= blen) goto bad;
-                op_flags[rule[3]] |= 0x01;
-                i += 4;
-                break;
-            case RULE_ARGUMENT:
-                /* [searchtag, tag] */
-                i += 3;
-                break;
-            case RULE_GETTAG:
-                /* [searchtag, tag] */
-                i += 3;
-                has_backref = 1;
-                break;
-            case RULE_CONSTANT:
-                /* [constant, tag] */
-                if (rule[1] >= clen) goto bad;
-                i += 3;
-                break;
-            case RULE_CAPTURE_NUM:
-                /* [rule, base, tag] */
-                if (rule[1] >= blen) goto bad;
-                op_flags[rule[1]] |= 0x01;
-                i += 4;
-                break;
-            case RULE_ACCUMULATE:
-            case RULE_GROUP:
-            case RULE_CAPTURE:
-            case RULE_UNREF:
-                /* [rule, tag] */
-                if (rule[1] >= blen) goto bad;
-                op_flags[rule[1]] |= 0x01;
-                i += 3;
-                break;
-            case RULE_REPLACE:
-            case RULE_MATCHTIME:
-                /* [rule, constant, tag] */
-                if (rule[1] >= blen) goto bad;
-                if (rule[2] >= clen) goto bad;
-                op_flags[rule[1]] |= 0x01;
-                i += 4;
-                break;
-            case RULE_ERROR:
-            case RULE_DROP:
-            case RULE_NOT:
-            case RULE_TO:
-            case RULE_THRU:
-                /* [rule] */
-                if (rule[1] >= blen) goto bad;
-                op_flags[rule[1]] |= 0x01;
-                i += 2;
-                break;
-            case RULE_READINT:
-                /* [ width | (endianess << 5) | (signedness << 6), tag ] */
-                if (rule[1] > JANET_MAX_READINT_WIDTH) goto bad;
-                i += 3;
-                break;
-            default:
-                goto bad;
-        }
-    }
-
-    /* last instruction cannot overflow */
-    if (i != blen) goto bad;
-
-    /* Make sure all referenced instructions are actually
-     * in instruction positions. */
-    for (i = 0; i < blen; i++)
-        if (op_flags[i] == 0x01) goto bad;
+    PegVerifier verifier = peg_verify_init(peg);
+    peg_verify_run(&verifier);
 
     /* Good return */
     peg->bytecode = bytecode;
     peg->constants = constants;
-    peg->has_backref = has_backref;
-    janet_free(op_flags);
+    peg->has_backref = verifier.has_backref;
+    peg_verify_free(&verifier);
     return peg;
-
-bad:
-    janet_free(op_flags);
-    janet_panic("invalid peg bytecode");
 }
 
 static int cfun_peg_getter(JanetAbstract a, Janet key, Janet *out);
@@ -1656,17 +1781,20 @@ typedef struct {
     int32_t start;
 } PegCall;
 
+static inline JanetPeg* unwrap_peg(Janet val) {
+    if (janet_checktype(val, JANET_ABSTRACT) &&
+            janet_abstract_type(janet_unwrap_abstract(val)) == &janet_peg_type) {
+        return (JanetPeg*) janet_unwrap_abstract(val);
+    } else {
+        return compile_peg(val);
+    }
+}
 /* Initialize state for peg cfunctions */
 static PegCall peg_cfun_init(int32_t argc, Janet *argv, int get_replace) {
     PegCall ret;
     int32_t min = get_replace ? 3 : 2;
     janet_arity(argc, get_replace, -1);
-    if (janet_checktype(argv[0], JANET_ABSTRACT) &&
-            janet_abstract_type(janet_unwrap_abstract(argv[0])) == &janet_peg_type) {
-        ret.peg = janet_unwrap_abstract(argv[0]);
-    } else {
-        ret.peg = compile_peg(argv[0]);
-    }
+    ret.peg = unwrap_peg(argv[0]);
     if (get_replace) {
         ret.repl = janet_getbytes(argv, 1);
         ret.bytes = janet_getbytes(argv, 2);
@@ -1779,10 +1907,136 @@ JANET_CORE_FN(cfun_peg_replace,
     return cfun_peg_replace_generic(argc, argv, 1);
 }
 
+struct peg_disassembler {
+    JanetArray *bytecode;
+};
+
+static Janet determine_opcode_name(JanetPegOpcod opcode);
+
+static JanetTuple decode_opcode_tuple(const PegInsn *insn) {
+    Janet opcode_name = determine_opcode_name(insn->opcode);
+    switch (insn->fmt) {
+        case FMT_1WORD:
+        case FMT_2WORD:
+        case FMT_3WORD: {
+            size_t num_args =  insn->data.fixed_size;
+            janet_assert(insn->encoded_size == num_args + 1, "Bad encoded size");
+            janet_assert(num_args <= 3, "too many args");
+            Janet res[5] = {opcode_name};
+            for (size_t i = 0; i < num_args; i++){
+                res[i + 1] = janet_wrap_integer(insn->encoded[i + 1]);
+            }
+            return janet_tuple_n(res, num_args + 1);
+        }
+        case FMT_BITMAP: {
+            janet_assert(insn->encoded_size == 9, "Expected bitmap to have 8 bytes");
+            Janet bitmap = janet_stringv((uint8_t*) insn->encoded + 1, 8 * sizeof(uint32_t));
+            Janet res[3] = {opcode_name, janet_ckeywordv("bitmap"), bitmap};
+            return janet_tuple_n(res, 3);
+        }
+        case FMT_VARBYTES: {
+            size_t num_bytes = insn->data.varbytes.len;
+            size_t encoded_capacity = (insn->encoded_size - 1) * sizeof(uint32_t);
+            janet_assert(num_bytes <= encoded_capacity, "Claimed bytes >= encoded capacity");
+            Janet bytes = janet_stringv(insn->data.varbytes.bytes, num_bytes);
+            Janet res[2] = {opcode_name, bytes};
+            return janet_tuple_n(res, 2);
+        }
+        case FMT_NESTED_RULES: {
+            size_t len = insn->data.nested_rules.len;
+            uint32_t *rules = insn->data.nested_rules.rules;
+            Janet *res = janet_tuple_begin(len + 1);
+            res[0] = opcode_name;
+            for (size_t i = 0; i < len; i++) {
+                res[i + 1] = janet_wrap_integer(rules[i]);
+            }
+            return janet_tuple_end(res);
+        }
+        case FMT_FIXED_SIZE_START:
+            janet_panic("Invalid peg opcode is only marker: FMT_FIXED_SIZE_START");
+    }
+    // fallthrough to error on bad format
+    janet_panicf("Unknown peg bytecode fmt: %d", insn->fmt);
+} 
+
+static void disassembler_callback(void *raw_ctx, const PegInsn *insn) {
+    struct peg_disassembler *ctx = (struct peg_disassembler*) raw_ctx;
+    JanetTuple res = decode_opcode_tuple(insn);
+    uint32_t len = janet_tuple_length(res);
+    if (len > 2) janet_panicf("Invalid length: %d", len);
+    janet_checktype(res[0], JANET_KEYWORD);
+    janet_array_push(ctx->bytecode, janet_wrap_tuple(res));
+}
+
+static Janet determine_opcode_name(JanetPegOpcod opcode) {
+    if (opcode > MAX_PEG_OPCODE) goto bad_opcode_id;
+    const char *const raw_name = OPCODE_NAME_INFO[opcode];
+    if (raw_name == NULL) goto bad_opcode_id;
+    const size_t raw_name_len = strlen(raw_name);
+    // verify `name` is prefixed with `RANGE_`
+    static const size_t NAME_PREFIX_LEN = 6;
+    static const char NAME_PREFIX[NAME_PREFIX_LEN] = "RANGE_";
+    // check length
+    if (raw_name_len <= NAME_PREFIX_LEN) goto bad_opcode_name;
+    // do memcmp to verify prefix is present
+    if (memcmp(raw_name, NAME_PREFIX, NAME_PREFIX_LEN) != 0) goto bad_opcode_name;
+    /*
+     * Convert from ASCII uppercase to ASCII lowercase.
+     * We need to allocate scratch memory to
+     * avoid modifying read-only constants memory (raw_name.
+     */
+    size_t lowercase_name_len = raw_name_len - NAME_PREFIX_LEN;
+    if (lowercase_name_len == 0) goto bad_opcode_name;
+    char *lowercase_name = janet_smalloc(lowercase_name_len);
+    // initialize with original characters, then do rewrite in-place
+    memcpy(lowercase_name + NAME_PREFIX_LEN, lowercase_name, lowercase_name_len);
+    for (size_t i = 0; i < lowercase_name_len; i++) {
+        char c = lowercase_name[i];
+        if (c == '_') {
+            c = '-'; // In Lisp, it is conventional to use `-` as seperator
+        } else if (c >= 'A' && c <= 'Z') {
+            c = 'a' + (c - 'A');
+        } else {
+            janet_panicf(
+                "Unexpected character %c in peg opcode name %s",
+                c, raw_name
+            );
+        }
+        lowercase_name[i] = c;
+    }
+    return janet_keywordv((uint8_t*) lowercase_name, lowercase_name_len);
+    bad_opcode_name:
+        janet_panicf("Unexpected peg opcode name: %s", raw_name);
+    bad_opcode_id:
+        janet_panicf("Unexpected peg opcode id: %d", (int) opcode);
+}
+
 JANET_CORE_FN(cfun_peg_disasm,
               "(peg/disasm peg)",
               "Disassemble the specified peg grammar, similar to builtin (disasm) function for regular bytecode.") {
-    janet_panic("Not implemented");
+    janet_fixarity(argc, 1);
+    JanetPeg *peg = unwrap_peg(argv[0]);
+    struct peg_disassembler ctx = {
+        .bytecode = janet_array(32),
+    };
+    /* Begin disassembly */
+    PegVerifier verifier = peg_verify_init(peg);
+    verifier.user_ctx = (void*) &ctx;
+    verifier.callback = disassembler_callback;
+    peg_verify_run(&verifier);
+    peg_verify_free(&verifier);
+    JanetKV *res = janet_struct_begin(2);
+    janet_struct_put(
+        res,
+        janet_ckeywordv("raw-bytecode"),
+        janet_wrap_tuple(janet_tuple_n(ctx.bytecode->data, ctx.bytecode->count))
+    );
+    janet_struct_put(
+        res,
+        janet_ckeywordv("constants"),
+        janet_wrap_tuple(janet_tuple_n(peg->constants, peg->num_constants))
+    );
+    return janet_wrap_struct(janet_struct_end(res));
 }
 
 static JanetMethod peg_methods[] = {
